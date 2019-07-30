@@ -1,0 +1,377 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>false</active>
+        <api_name>x_58872_needit.JournalRedactor</api_name>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>JournalRedactor</name>
+        <script><![CDATA[/*
+	Script Include
+		Name: JournalRedactor
+		Client Callable: false
+		Accessible from: All scopes
+		Usage documentation: http://redactor.snc.guru/
+*/
+
+var JournalRedactor = Class.create();
+JournalRedactor.prototype = {
+	initialize: function(journalEntryID) {
+		this.journalEntryData = new this._JournalEntry();
+		if (journalEntryID) {
+			this.journalEntryData.journal_entry_id = journalEntryID;
+			this._populateJournalEntryData(journalEntryID);
+		}
+		this._verbose = false;
+	},
+	
+	/**
+	 * Redact or delete a given journal entry. This will redact or delete the sys_journal_field entry, the sys_audit record, and the sys_history_set (along with all sys_history_lines associated with it).
+	 * @param deleteEntry {boolean} True if the journal entry should be deleted rather than replaced with some other text, false if it should be replaced. If this param is set to false, then the second param (newValue) must be specified.
+	 * @param newValue {string=} The new value to replace the old journal text with. If deleteEntry is set to false, this param is mandatory. Otherwise, it is not necessary.
+	 * @returns {boolean} True if redaction was successful; false if not. If redaction was unsuccessful, an error should be found in the system logs from the source "redact method of JournalRedactor Script Include".
+	 */
+	redact: function(deleteEntry, newValue) {
+		if (!this._readyForRedaction(this.journalEntryData)) {
+			gs.logError('Not ready for redaction. Some data is missing from journalEntryData: ' +
+				JSON.stringify(this.journalEntryData),
+				'redact method of JournalRedactor Script Include');
+			return false;
+		}
+		if (!deleteEntry && !newValue) {
+			//If deleteEntry is not true, but no new value is specified, log an error
+			gs.logError('deleteEntry is not true, but newValue is not specified. Cannot ' +
+				'continue.', 'redact method of JournalRedactor Script Include');
+			return false;
+		} else if (!this.journalEntryData.journal_entry_id) {
+			gs.logError('Journal entry ID not known. Please call setJournalID() or ' +
+				'findJournalID() methods to set or find the journal ID before attempting ' +
+				'to redact.', 'redact method of JournalRedactor Script Include');
+			return false;
+		}
+		if (newValue) {
+			this.journalEntryData.new_journal_value = newValue;
+		}
+		
+		var success = (this._redactJournalEntry(this.journalEntryData, deleteEntry, newValue) &&
+			this._redactAudit(this.journalEntryData, deleteEntry, newValue) &&
+			this._deleteHistory(this.journalEntryData));
+		
+		return success;
+	},
+	
+	/**
+	 * This method allows you to explicitly set the journal entry you'd like to redact by
+	 *  specifying the sys_id of that record in the sys_journal_field table.
+	 * You can also specify this in the constructor. If you don't know the journal entry
+	 *  sys_id, you can use the .findJournalID() method.
+	 * @param journalEntryID {string} The sys_id of the record in the sys_journal_field
+	 *  table, corresponding to the journal entry you'd like to redact.
+	 * @returns {boolean} true if successful, false if not.
+	 */
+	setJournalID: function(journalEntryID) {
+		if (!journalEntryID) {
+			gs.logWarning('setJournalID method of JournalRedactor Script Include called, ' +
+				'but no journal entry sys_id was specified. Clearing journal entry ID value.',
+				'JournalRedactor Script Include setJournalID method');
+			this.journalEntryData.journal_entry_id = '';
+			return false;
+		} else {
+			this.journalEntryData.journal_entry_id = journalEntryID;
+		}
+		return this._populateJournalEntryData(journalEntryID); //Need this data in the data object for future redaction steps.
+	},
+	
+	/**
+	 * Use this method if you don't already know the sys_id of the sys_journal_field
+	 *  record corresponding to the journal entry you'd like to redact or delete.
+	 * This will grab all the necessary data and populate it into the journalEntryData
+	 *  object.
+	 * This method accepts two, three, or four arguments.
+	 * @param recordID {String}
+	 * @param journalText {String}
+	 * @param targetTableName {String=}
+	 * @param journalFieldName {String=}
+	 * @returns {Boolean} True if the journal entry was successfully located, or false if it was not.
+	 */
+	findJournalID: function(recordID, journalText, targetTableName, journalFieldName) {
+		var journalEntryID;
+		
+		if (this._verbose) {
+			gs.log('Attempting to find record in sys_journal_field table, with ' +
+				arguments.length + ' arguments: ' + JSON.stringify(arguments));
+		}
+		
+		/*//Set variables based on number of arguments specified
+		if (arguments.length == 2) {
+			recordID = arguments[0];
+			journalText = arguments[1];
+		} else if (arguments.length == 3) {
+			recordID = arguments[0];
+			targetTableName = arguments[1];
+			journalText = arguments[2];
+		} else if (arguments.length = 4) {
+			recordID = arguments[0];
+			targetTableName = arguments[1];
+			journalFieldName = arguments[2];
+			journalText = arguments[3];
+		}*/
+		if (arguments.length < 2 || arguments.length > 4) { //ERROR!
+			gs.logError('Incorrect number of arguments specified. ' + arguments.length +
+				' arguments specified, but 2, 3, or 4 arguments are expected.',
+				'getJournalID method of JournalRedactor Script Include');
+			return false;
+		}
+		
+		/*if (!recordID || !journalText) {
+			gs.logError('getJournalID method of JournalRedactor Script Include could not ' +
+				'continue. Invalid argument(s) specified. recordID: ' + recordID + '. ' +
+				'journalText: ' + journalText + '.');
+			return this.journalEntryData;
+		}*/ //replaced by handling for different numbers of arguments above
+		
+		//Update details in journalEntryData
+		this.journalEntryData.target_record_id = recordID;
+		this.journalEntryData.old_journal_value = journalText;
+		
+		var grJournal = new GlideRecord('sys_journal_field');
+		grJournal.addQuery('element_id', recordID);
+		grJournal.addQuery('value', journalText);
+		if (targetTableName) {
+			grJournal.addQuery('name', targetTableName);
+		}
+		if (journalFieldName) {
+			grJournal.addQuery('element', journalFieldName);
+		}
+		grJournal.query();
+		
+		if (grJournal.next()) {
+			journalEntryID = grJournal.getValue('sys_id');
+			journalFieldName = grJournal.getValue('element');
+			targetTableName = grJournal.getValue('name');
+			
+			this.journalEntryData.journal_entry_id = journalEntryID;
+			this.journalEntryData.journal_field_name = journalFieldName;
+			this.journalEntryData.target_table_name = targetTableName;
+		} else {
+			return false;
+		}
+		if (grJournal.hasNext() && this._verbose) {
+			gs.log('findJournalID() method of JournalRedactor Script Include: ' +
+				'Additional journal entry was found, matching these arguments: ' +
+				JSON.stringify(arguments) + '. You may want to run this script again.');
+		}
+		
+		return journalEntryID;
+	},
+	
+	/**
+	 * Set verbose mode to true or false. This enables additional logging if true.
+	 * @param b {boolean}
+	 */
+	setVerbose: function(b) {
+		this._verbose = b;
+	},
+	
+	/******PRIVATE METHODS BELOW******/
+	
+	_readyForRedaction: function(journalEntryData) {
+		var p;
+		journalEntryData = journalEntryData ? journalEntryData : this.journalEntryData;
+		
+		if (this._verbose) {
+			gs.log('Checking if journalEntryData is ready for redaction: ' +
+				JSON.stringify(journalEntryData));
+		}
+		
+		for (p in journalEntryData) {
+			if (journalEntryData.hasOwnProperty(p)) {
+				if (p != 'old_journal_value' && !journalEntryData[p]) {
+					if (this._verbose) {
+						gs.log('journalEntryData not ready for redaction: ' +
+							JSON.stringify(journalEntryData));
+					}
+					return false;
+				}
+			}
+		}
+		if (this._verbose) {
+			gs.log('journalEntryData IS ready for redaction: ' +
+				JSON.stringify(journalEntryData));
+		}
+		return true;
+	},
+	
+	_redactJournalEntry: function(journalEntryData, deleteEntry, newValue) {
+		journalEntryData = journalEntryData ? journalEntryData : this.journalEntryData;
+		
+		if (this._verbose) {
+			gs.log('Beginning redaction of sys_journal_field record: ' +
+				JSON.stringify(journalEntryData));
+		}
+		
+		if (!deleteEntry && !newValue) {
+			//If deleteEntry is not true, but no new value is specified, log an error
+			gs.logError('deleteEntry is not true, but newValue is not specified. Cannot ' +
+				'continue.', '_redactJournalEntry method of JournalRedactor Script Include');
+			return false;
+		} else if (!journalEntryData.journal_entry_id) {
+			gs.logError('Journal entry ID not known. Please call setJournalID() or ' +
+				'findJournalID() methods to set or find the journal ID before attempting ' +
+				'to redact.', '_redactJournalEntry method of JournalRedactor Script Include');
+			return false;
+		}
+		
+		var grJournal = new GlideRecord('sys_journal_field');
+		grJournal.get(journalEntryData.journal_entry_id);
+		if (deleteEntry) {
+			grJournal.deleteRecord();
+			if (this._verbose) {
+				gs.log('Deleted journal entry with ID ' + journalEntryData.journal_entry_id);
+			}
+		} else {
+			grJournal.setValue('value', newValue);
+			grJournal.update();
+			if (this._verbose) {
+				gs.log('Updated journal entry with ID ' + journalEntryData.journal_entry_id +
+					' to new value: ' + newValue);
+			}
+		}
+		if (this._verbose) {
+			gs.log('redaction complete: ' +
+				JSON.stringify(journalEntryData));
+		}
+		return true;
+	},
+	
+	
+	_redactAudit: function(journalEntryData, deleteEntry, newValue) {
+		journalEntryData = journalEntryData ? journalEntryData : this.journalEntryData;
+		if (this._verbose) {
+			gs.log('Beginning redaction of sys_audit record: ' +
+				JSON.stringify(journalEntryData));
+		}
+		if (!deleteEntry && !newValue) {
+			//If deleteEntry is not true, but no new value is specified, log an error
+			gs.logError('deleteEntry is not true, but newValue is not specified. Cannot ' +
+				'continue.', '_redactAudit method of JournalRedactor Script Include');
+			return false;
+		} else if (!journalEntryData.journal_entry_id) {
+			gs.logError('Journal entry ID not known. Please call setJournalID() or ' +
+				'findJournalID() methods to set or find the journal ID before attempting ' +
+				'to redact.', '_redactAudit method of JournalRedactor Script Include');
+			return false;
+		}
+		
+		var grAudit = new GlideRecord('sys_audit');
+		
+		grAudit.addQuery('tablename', journalEntryData.target_table_name);
+		grAudit.addQuery('documentkey', journalEntryData.target_record_id);
+		grAudit.addQuery('newvalue', journalEntryData.old_journal_value);
+		//field names are not misspelled, they're just weird in this table.
+		grAudit.query();
+		
+		while (grAudit.next()) {
+			if (deleteEntry) {
+				if (this._verbose) {
+					gs.log('Deleting audit record because deleteEntry param is set to ' +
+						deleteEntry);
+				}
+				grAudit.deleteRecord();
+			} else {
+				if (this._verbose) {
+					gs.log('Updating audit record because deleteEntry param is set to ' +
+						deleteEntry + ' and newValue is set to ' + newValue);
+				}
+				grAudit.setValue('newvalue', newValue);
+				grAudit.update();
+			}
+		}
+		if (this._verbose) {
+			gs.log('_redactAudit() finished');
+		}
+		return true;
+	},
+	
+	_deleteHistory: function(journalEntryData) {
+		journalEntryData = journalEntryData ? journalEntryData : this.journalEntryData;
+		if (this._verbose) {
+			gs.log('_deleteHistory() running with journalEntryData: ' +
+				JSON.stringify(journalEntryData));
+		}
+		if (!journalEntryData.target_record_id || !journalEntryData.target_table_name) {
+			gs.logError(
+				'Journal entry ID or target table name not known. Please call setJournalID() or ' +
+				'findJournalID() methods to set or find the journal ID before attempting ' +
+				'to redact.', '_deleteHistory method of JournalRedactor Script Include');
+			return false;
+		}
+		
+		var grHistorySet = new GlideRecord('sys_history_set');
+		
+		grHistorySet.addQuery('id', journalEntryData.target_record_id);
+		grHistorySet.addQuery('table', journalEntryData.target_table_name);
+		grHistorySet.deleteMultiple();
+		
+		if (this._verbose) {
+			gs.log('_deleteHistory() finished with journalEntryData: ' +
+				JSON.stringify(journalEntryData));
+		}
+		return true;
+	},
+	
+	/**
+	 * Populates journalEntryData object using a sys_journal_field record sys_id.
+	 * @param journalEntryID {string}
+	 * @returns {boolean}
+	 * @private
+	 */
+	_populateJournalEntryData: function(journalEntryID) {
+		if (this._verbose) {
+			gs.log('_populateJournalEntryData() running with journalEntryID: ' + journalEntryID);
+		}
+		var grJournal = new GlideRecord('sys_journal_field');
+		if (grJournal.get(journalEntryID)) {
+			this.journalEntryData.target_record_id = grJournal.getValue('element_id');
+			this.journalEntryData.target_table_name = grJournal.getValue('name');
+			this.journalEntryData.old_journal_value = grJournal.getValue('value');
+			this.journalEntryData.journal_field_name = grJournal.getValue('element');
+			grJournal.update();
+			
+			if (this._verbose) {
+				gs.log('_populateJournalEntryData() finished with journalEntryData: ' +
+					JSON.stringify(this.journalEntryData));
+			}
+			return true;
+		} else {
+			gs.logError('sys_journal_field record with sys_id ' + journalEntryID + ' not found.',
+				'_populateJournalEntryData method of JournalRedactor Script Include');
+			return false;
+		}
+	},
+	
+	_JournalEntry: function() {
+		this.journal_entry_id = '';
+		this.target_record_id = '';
+		this.target_table_name = '';
+		this.old_journal_value = '';
+		this.journal_field_name = '';
+		this.new_journal_value = '';
+	},
+	
+	type: 'JournalRedactor'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-07-24 14:59:52</sys_created_on>
+        <sys_id>d4a7add6dbf233007107656b4b961967</sys_id>
+        <sys_mod_count>1</sys_mod_count>
+        <sys_name>JournalRedactor</sys_name>
+        <sys_package display_value="NeedIt" source="x_58872_needit">6ead8e780f603200cd674f8ce1050ed1</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="NeedIt">6ead8e780f603200cd674f8ce1050ed1</sys_scope>
+        <sys_update_name>sys_script_include_d4a7add6dbf233007107656b4b961967</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2019-07-24 15:04:32</sys_updated_on>
+    </sys_script_include>
+</record_update>
